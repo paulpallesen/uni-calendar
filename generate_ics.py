@@ -1,28 +1,10 @@
 #!/usr/bin/env python3
-# Excel -> ICS generator with all-day support and "free/busy" control.
-#
-# Expected headers in row 1:
-# Unique ID | Course Code | Title | Category | Start Date | Start Time | End Date | End Time
-# Timezone | Location | Description | Link | TRANSPARENT
-#
-# Usage:
-#   python generate_ics.py --xlsx calendar.xlsx --out docs/calendar.ics
-#
-# Notes:
-# - All-day: leave Start Time and End Time blank. DTEND (DATE) is exclusive,
-#   so we add +1 day to the end date internally to make user-specified End Date inclusive.
-# - Timed events: supply Start Time and End Time (24h HH:MM). Timezone defaults to Australia/Sydney.
-# - TRANSPARENT column: TRUE/YES/TRANSPARENT => TRANSP:TRANSPARENT else OPAQUE.
-# - If you later add a "RRULE" or "EXDATE" header, this script will include them automatically.
-# - Includes a VTIMEZONE for Australia/Sydney (add more as needed).
-
 import argparse
 from openpyxl import load_workbook
 from datetime import datetime, timedelta
 import hashlib
 import os, sys
 
-# --- Config ---
 DEFAULT_TZ = "Australia/Sydney"
 
 AUS_TZ_VTIMEZONE = """BEGIN:VTIMEZONE
@@ -65,7 +47,6 @@ def parse_datetime(date_str, time_str):
     if d is None:
         return None
     if not time_str:
-        # default to midnight if time omitted (only used for timed events fallback)
         return datetime(d.year, d.month, d.day, 0, 0, 0)
     t = parse_time(time_str)
     return datetime(d.year, d.month, d.day, t.hour, t.minute, 0)
@@ -83,23 +64,21 @@ def make_uid(fields):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--xlsx", required=True)
-    ap.add_argument("--sheet", default="Events")  # if your sheet is named differently, set here
-    ap.add_argument("--out", default="docs/calendar.ics")
+    ap.add_argument("--sheet", default=None)  # auto-detect first sheet if not given
+    ap.add_argument("--out", default="calendar.ics")
     args = ap.parse_args()
 
     wb = load_workbook(args.xlsx, data_only=True)
-    if args.sheet not in wb.sheetnames:
-        print(f"Sheet '{args.sheet}' not found", file=sys.stderr)
-        sys.exit(1)
-    ws = wb[args.sheet]
+    sheet_name = args.sheet or wb.sheetnames[0]
+    ws = wb[sheet_name]
 
-    # Header map (case-insensitive match)
+    # Map headers exactly
     hdr_cells = next(ws.iter_rows(min_row=1, max_row=1, values_only=True))
     headers = [ (h or "").strip() for h in hdr_cells ]
-    header_map = { h.lower(): i for i, h in enumerate(headers) }
+    header_map = { h: i for i, h in enumerate(headers) }
 
     def col(name):
-        return header_map.get(name.lower(), -1)
+        return header_map.get(name, -1)
 
     col_UID = col("Unique ID")
     col_Course = col("Course Code")
@@ -115,10 +94,6 @@ def main():
     col_URL = col("Link")
     col_TRANSP = col("TRANSPARENT")
 
-    # Optional extra columns if you add them later
-    col_RRULE = header_map.get("rrule", -1)
-    col_EXDATE = header_map.get("exdate", -1)
-
     now_utc = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
 
     lines = [
@@ -130,8 +105,9 @@ def main():
         AUS_TZ_VTIMEZONE.strip()
     ]
 
+    event_count = 0
+
     for r in ws.iter_rows(min_row=2, values_only=True):
-        # skip entirely empty rows
         if r is None or all(v in (None, "") for v in r):
             continue
 
@@ -152,17 +128,11 @@ def main():
         url = (r[col_URL] or "").strip() if col_URL >= 0 and r[col_URL] else ""
         is_transparent = truthy(r[col_TRANSP]) if col_TRANSP >= 0 else False
 
-        rrule = (r[col_RRULE] or "").strip() if col_RRULE >= 0 and r[col_RRULE] else ""
-        exdate_raw = (r[col_EXDATE] or "").strip() if col_EXDATE >= 0 and r[col_EXDATE] else ""
-
         if not sdate:
-            # must have at least a start date
             continue
 
-        # Decide all-day vs timed
         is_all_day = (not stime and not etime)
 
-        # Build UID if missing
         if not uid:
             base_fields = [course, title, sdate, edate or "", stime or "", etime or "", location]
             uid = make_uid(base_fields)
@@ -176,12 +146,10 @@ def main():
         if location:
             lines.append(f"LOCATION:{location}")
         if desc:
-            # Preserve \n as literal newlines in ICS
             lines.append("DESCRIPTION:" + desc.replace("\\n", "\\n"))
         if url:
             lines.append(f"URL:{url}")
 
-        # Categories for filtering/colouring
         cats = []
         if course: cats.append(course)
         if cat: cats.append(cat)
@@ -189,17 +157,40 @@ def main():
         if cats:
             lines.append(f"CATEGORIES:{','.join(cats)}")
 
-        # Free/Busy transparency
         lines.append(f"TRANSP:{'TRANSPARENT' if is_transparent else 'OPAQUE'}")
 
         if is_all_day:
-            # All-day: DATE values (no TZ). DTEND is exclusive, so add +1 day.
             start_d = parse_date(sdate)
             if not start_d:
                 lines.append("END:VEVENT")
                 continue
-
             if edate:
-                end_d_inclusive = parse_date(edate)
-                if not end_d_inclusive:
-                    end
+                end_d_exclusive = parse_date(edate) + timedelta(days=1)
+            else:
+                end_d_exclusive = start_d + timedelta(days=1)
+            lines.append(f"DTSTART;VALUE=DATE:{fmt_date(start_d)}")
+            lines.append(f"DTEND;VALUE=DATE:{fmt_date(end_d_exclusive)}")
+        else:
+            dt_start = parse_datetime(sdate, stime or "00:00")
+            if edate:
+                dt_end = parse_datetime(edate, etime or stime or "00:00")
+            else:
+                dt_end = parse_datetime(sdate, etime or "00:00")
+            if not dt_start or not dt_end:
+                lines.append("END:VEVENT")
+                continue
+            lines.append(f"DTSTART;TZID={tz}:{fmt_local(dt_start)}")
+            lines.append(f"DTEND;TZID={tz}:{fmt_local(dt_end)}")
+
+        lines.append("END:VEVENT")
+        event_count += 1
+
+    lines.append("END:VCALENDAR")
+
+    with open(args.out, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines))
+
+    print(f"Wrote {args.out} with {event_count} events")
+
+if __name__ == "__main__":
+    main()
